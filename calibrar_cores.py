@@ -1,160 +1,208 @@
+"""Utilitario visual para calibrar os limites HSV das cores do cubo."""
+
+from __future__ import annotations
+
+from typing import Final, TypedDict
+
 import cv2
 import numpy as np
-import json
-import platform
-import time
-import os # <--- Adicionado para checar se o arquivo existe
 
-# Função vazia necessária para as trackbars do OpenCV
-def empty(a):
-    pass
+from src.utils.file_manager import FileAccessError, load_json, save_json
+from src.vision.camera import Camera, CameraConnectionError
 
-# Função para encontrar automaticamente a Logitech C920
-def encontrar_camera_c920():
-    if platform.system() == "Windows":
-        try:
-            from pygrabber.dshow_graph import FilterGraph
-            graph = FilterGraph()
-            devices = graph.get_input_devices()
-            
-            for indice, nome in enumerate(devices):
-                if "C920" in nome.upper():
-                    print(f"✅ Logitech C920 encontrada no índice {indice} ({nome})")
-                    return indice
-        except ImportError:
-            print("⚠️ Biblioteca 'pygrabber' não encontrada. Tentando método alternativo...")
-    
-    print("Buscando câmera por tentativa e erro (buscando suporte a 1080p)...")
-    for i in range(5):
-        cap_temp = cv2.VideoCapture(i)
-        if cap_temp.isOpened():
-            cap_temp.set(cv2.CAP_PROP_FRAME_WIDTH, 600)
-            cap_temp.set(cv2.CAP_PROP_FRAME_HEIGHT, 800)
-            largura_real = cap_temp.get(cv2.CAP_PROP_FRAME_WIDTH)
-            cap_temp.release() 
-            
-            if largura_real == 1920:
-                print(f"✅ Câmera Full HD (possível C920) encontrada no índice {i}")
-                return i
-                
-    print("❌ C920 não encontrada automaticamente. Usando câmera padrão (0).")
-    return 0
+CALIBRATION_FILE: Final[str] = "cores_cubo.json"
+TRACKBARS_WINDOW: Final[str] = "Trackbars"
+WEBCAM_WINDOW: Final[str] = "Webcam Original"
+MASK_WINDOW: Final[str] = "Mascara (Limiarizacao)"
+ESC_KEY: Final[int] = 27
 
-# Criação da janela e das Trackbars de calibração
-cv2.namedWindow("Trackbars")
-cv2.resizeWindow("Trackbars", 640, 250)
-cv2.createTrackbar("Hue Min", "Trackbars", 0, 179, empty)
-cv2.createTrackbar("Hue Max", "Trackbars", 179, 179, empty)
-cv2.createTrackbar("Sat Min", "Trackbars", 0, 255, empty)
-cv2.createTrackbar("Sat Max", "Trackbars", 255, 255, empty)
-cv2.createTrackbar("Val Min", "Trackbars", 0, 255, empty)
-cv2.createTrackbar("Val Max", "Trackbars", 255, 255, empty)
+COLOR_KEYS: Final[dict[int, str]] = {
+    ord("v"): "vermelho",
+    ord("g"): "verde",
+    ord("a"): "azul",
+    ord("m"): "amarelo",
+    ord("l"): "laranja",
+    ord("b"): "branco",
+}
 
-# --- MODIFICAÇÃO PRINCIPAL: Carregar JSON existente ---
-arquivo_json = 'cores_cubo.json'
-calibracoes = {}
+STATUS_BY_COLOR: Final[dict[str, str]] = {
+    "vermelho": "Vermelho atualizado!",
+    "verde": "Verde atualizado!",
+    "azul": "Azul atualizado!",
+    "amarelo": "Amarelo atualizado!",
+    "laranja": "Laranja atualizado!",
+    "branco": "Branco atualizado!",
+}
 
-if os.path.exists(arquivo_json):
-    with open(arquivo_json, 'r', encoding='utf-8') as f:
-        calibracoes = json.load(f)
-    mensagem_status = "JSON carregado! Ajuste e regrave a cor desejada."
-else:
-    mensagem_status = "Novo JSON. Ajuste as barras e grave a cor."
-# --------------------------------------------------------
 
-# Conexão com a câmera
-indice_c920 = encontrar_camera_c920()
+class ColorCalibration(TypedDict):
+    """Limites HSV inferiores e superiores de uma cor."""
 
-if platform.system() == "Windows":
-    # cv2.CAP_DSHOW melhora a compatibilidade com a C920 no Windows
-    cap = cv2.VideoCapture(indice_c920, cv2.CAP_DSHOW)
-else:
-    cap = cv2.VideoCapture(indice_c920)
+    lower: list[int]
+    upper: list[int]
 
-print("Aguardando a câmera iniciar...")
-time.sleep(1.5) # Dá tempo para a câmera "acordar"
 
-# Força resolução 1080p para maior precisão
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 600)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 800)
+Calibrations = dict[str, ColorCalibration]
 
-while True:
-    success, frame = cap.read()
-    if not success:
-        print("❌ Erro crítico: O OpenCV conectou na câmera, mas não conseguiu puxar a imagem.")
-        print("Verifique se outro programa (Discord, OBS, Zoom, navegador) não está com ela aberta!")
-        break
 
-    # Converte de BGR para HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+def empty(_value: int) -> None:
+    """Callback vazio exigido pela API de trackbars do OpenCV."""
 
-    # Lê as posições atuais das trackbars
-    h_min = cv2.getTrackbarPos("Hue Min", "Trackbars")
-    h_max = cv2.getTrackbarPos("Hue Max", "Trackbars")
-    s_min = cv2.getTrackbarPos("Sat Min", "Trackbars")
-    s_max = cv2.getTrackbarPos("Sat Max", "Trackbars")
-    v_min = cv2.getTrackbarPos("Val Min", "Trackbars")
-    v_max = cv2.getTrackbarPos("Val Max", "Trackbars")
+
+def run() -> int:
+    """Executa a interface de calibracao HSV."""
+
+    try:
+        calibrations, status_message = load_existing_calibrations(CALIBRATION_FILE)
+        create_trackbars()
+
+        with Camera() as cam:
+            while True:
+                frame = cam.get_frame()
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                lower_color, upper_color, current_values = read_trackbar_values()
+                mask = cv2.inRange(hsv, lower_color, upper_color)
+
+                draw_detected_contours(frame, mask)
+                draw_hud(frame, status_message)
+
+                cv2.imshow(WEBCAM_WINDOW, frame)
+                cv2.imshow(MASK_WINDOW, mask)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ESC_KEY:
+                    break
+
+                if key in COLOR_KEYS:
+                    color_name = COLOR_KEYS[key]
+                    calibrations[color_name] = current_values
+                    status_message = STATUS_BY_COLOR[color_name]
+                elif key == ord("s"):
+                    save_json(CALIBRATION_FILE, calibrations)
+                    status_message = "Arquivo 'cores_cubo.json' SALVO!"
+
+        return 0
+    except (CameraConnectionError, FileAccessError) as exc:
+        print("\nNao foi possivel executar a calibracao.")
+        print(str(exc))
+        return 1
+    finally:
+        cv2.destroyAllWindows()
+
+
+def load_existing_calibrations(filepath: str) -> tuple[Calibrations, str]:
+    """Carrega calibracoes existentes ou inicia um dicionario vazio."""
+
+    try:
+        raw_calibrations = load_json(filepath)
+    except FileAccessError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return {}, "Novo JSON. Ajuste as barras e grave a cor."
+        raise
+
+    return normalize_calibrations(raw_calibrations), (
+        "JSON carregado! Ajuste e regrave a cor desejada."
+    )
+
+
+def normalize_calibrations(raw_calibrations: dict[str, object]) -> Calibrations:
+    """Converte o dicionario JSON para o tipo esperado pelo calibrador."""
+
+    calibrations: Calibrations = {}
+    for color_name, raw_value in raw_calibrations.items():
+        if not isinstance(raw_value, dict):
+            continue
+
+        lower = raw_value.get("lower")
+        upper = raw_value.get("upper")
+        if not isinstance(lower, list) or not isinstance(upper, list):
+            continue
+
+        calibrations[color_name] = {
+            "lower": [int(value) for value in lower],
+            "upper": [int(value) for value in upper],
+        }
+
+    return calibrations
+
+
+def create_trackbars() -> None:
+    """Cria a janela e as trackbars de calibracao HSV."""
+
+    cv2.namedWindow(TRACKBARS_WINDOW)
+    cv2.resizeWindow(TRACKBARS_WINDOW, 640, 250)
+    cv2.createTrackbar("Hue Min", TRACKBARS_WINDOW, 0, 179, empty)
+    cv2.createTrackbar("Hue Max", TRACKBARS_WINDOW, 179, 179, empty)
+    cv2.createTrackbar("Sat Min", TRACKBARS_WINDOW, 0, 255, empty)
+    cv2.createTrackbar("Sat Max", TRACKBARS_WINDOW, 255, 255, empty)
+    cv2.createTrackbar("Val Min", TRACKBARS_WINDOW, 0, 255, empty)
+    cv2.createTrackbar("Val Max", TRACKBARS_WINDOW, 255, 255, empty)
+
+
+def read_trackbar_values() -> tuple[np.ndarray, np.ndarray, ColorCalibration]:
+    """Le os valores atuais das trackbars HSV."""
+
+    h_min = cv2.getTrackbarPos("Hue Min", TRACKBARS_WINDOW)
+    h_max = cv2.getTrackbarPos("Hue Max", TRACKBARS_WINDOW)
+    s_min = cv2.getTrackbarPos("Sat Min", TRACKBARS_WINDOW)
+    s_max = cv2.getTrackbarPos("Sat Max", TRACKBARS_WINDOW)
+    v_min = cv2.getTrackbarPos("Val Min", TRACKBARS_WINDOW)
+    v_max = cv2.getTrackbarPos("Val Max", TRACKBARS_WINDOW)
 
     lower_color = np.array([h_min, s_min, v_min])
     upper_color = np.array([h_max, s_max, v_max])
-
-    # Cria a máscara para limiarização
-    mask = cv2.inRange(hsv, lower_color, upper_color)
-
-    # Desenha os contornos da cor sendo testada no momento
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > 1000: # Filtra os ruídos
-            x, y, w, h = cv2.boundingRect(cnt)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-    # Interface de Texto na Tela (HUD)
-    cv2.putText(frame, "Gravar Cor: [V]ermelho [G]Verde [A]zul [M]Amarelo [L]Laranja [B]Branco", 
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    cv2.putText(frame, "Salvar JSON: Aperte [S] | Sair: Aperte [ESC]", 
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-    cv2.putText(frame, f"Status: {mensagem_status}", 
-                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-    cv2.imshow("Webcam Original", frame)
-    cv2.imshow("Mascara (Limiarizacao)", mask)
-
-    # Lógica do teclado para salvar as cores no dicionário
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == 27:  # 27 = Tecla ESC
-        break
-        
-    valores_atuais = {
+    current_values: ColorCalibration = {
         "lower": [int(h_min), int(s_min), int(v_min)],
-        "upper": [int(h_max), int(s_max), int(v_max)]
+        "upper": [int(h_max), int(s_max), int(v_max)],
     }
 
-    if key == ord('v'):
-        calibracoes['vermelho'] = valores_atuais
-        mensagem_status = "Vermelho atualizado!"
-    elif key == ord('g'):
-        calibracoes['verde'] = valores_atuais
-        mensagem_status = "Verde atualizado!"
-    elif key == ord('a'):
-        calibracoes['azul'] = valores_atuais
-        mensagem_status = "Azul atualizado!"
-    elif key == ord('m'):
-        calibracoes['amarelo'] = valores_atuais
-        mensagem_status = "Amarelo atualizado!"
-    elif key == ord('l'):
-        calibracoes['laranja'] = valores_atuais
-        mensagem_status = "Laranja atualizado!"
-    elif key == ord('b'):
-        calibracoes['branco'] = valores_atuais
-        mensagem_status = "Branco atualizado!"
-        
-    elif key == ord('s'):
-        with open(arquivo_json, 'w', encoding='utf-8') as f:
-            json.dump(calibracoes, f, indent=4)
-        mensagem_status = "Arquivo 'cores_cubo.json' SALVO!"
+    return lower_color, upper_color, current_values
 
-cap.release()
-cv2.destroyAllWindows()
+
+def draw_detected_contours(frame: np.ndarray, mask: np.ndarray) -> None:
+    """Desenha contornos grandes encontrados pela mascara ativa."""
+
+    contours, _hierarchy = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > 1000:
+            x, y, width, height = cv2.boundingRect(contour)
+            cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 0), 2)
+
+
+def draw_hud(frame: np.ndarray, status_message: str) -> None:
+    """Desenha as instrucoes e o status no frame da webcam."""
+
+    cv2.putText(
+        frame,
+        "Gravar Cor: [V]ermelho [G]Verde [A]zul [M]Amarelo [L]Laranja [B]Branco",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+    )
+    cv2.putText(
+        frame,
+        "Salvar JSON: Aperte [S] | Sair: Aperte [ESC]",
+        (10, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"Status: {status_message}",
+        (10, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
