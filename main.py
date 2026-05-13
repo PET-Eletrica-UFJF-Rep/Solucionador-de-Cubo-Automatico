@@ -1,221 +1,314 @@
+"""Ponto de entrada da aplicacao do solucionador de cubo."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Final, Literal
+
 import cv2
-import numpy as np
-import json
-import platform
-import time
 
-# --- 1. CARREGAMENTO DAS CALIBRAÇÕES ---
-try:
-    with open('cores_cubo.json', 'r', encoding='utf-8') as f:
-        calibracoes = json.load(f)
-    print("✅ Calibrações carregadas com sucesso!")
-except FileNotFoundError:
-    print("❌ Erro: O arquivo 'cores_cubo.json' não foi encontrado.")
-    exit()
+from config.settings import FACE_NOMES, FACE_ORDEM, JANELA_DETECCAO, JANELA_FACE
+from src.core.cube import Cube, CubeStateError
+from src.core.solver import Solver, SolverError
+from src.utils.file_manager import FileAccessError, load_json
+from src.utils.helpers import rotacionar_180, rotacionar_ccw, rotacionar_cw
+from src.vision.camera import Camera, CameraConnectionError
+from src.vision.scanner import FaceScanner, ScanFrameResult, ScannerCalibrationError
 
-cores_visuais = {
-    'vermelho': (0, 0, 255),
-    'verde': (0, 255, 0),
-    'azul': (255, 0, 0),
-    'amarelo': (0, 255, 255),
-    'laranja': (0, 165, 255),
-    'branco': (255, 255, 255)
+StepKind = Literal["capture", "return_u"]
+FaceGrid = list[list[str]]
+RotationFunction = Callable[[FaceGrid], FaceGrid]
+
+CALIBRATION_FILE: Final[str] = "cores_cubo.json"
+STABLE_FRAMES_REQUIRED: Final[int] = 10
+ESC_KEY: Final[int] = 27
+WINDOW_WIDTH: Final[int] = 1280
+WINDOW_HEIGHT: Final[int] = 720
+
+CAPTURE_HINTS: Final[dict[str, str]] = {
+    "U": "(sua face inicial)",
+    "F": "-> Tombe o cubo P/ TRAS 1x",
+    "R": "-> Tombe o cubo P/ ESQUERDA",
+    "D": "-> Tombe o cubo P/ TRAS 2x",
+    "L": "-> Tombe o cubo P/ DIREITA",
+    "B": "-> Tombe o cubo P/ FRENTE 1x",
 }
 
-# --- FUNÇÃO AUXILIAR: ORDENAR PONTOS (Resolve o problema do ângulo) ---
-def ordenar_pontos(pts):
-    pts = pts.reshape(4, 2)
-    ordenados = np.zeros((4, 2), dtype=np.float32)
+FACE_ROTATIONS: Final[dict[str, RotationFunction]] = {
+    "R": rotacionar_cw,
+    "L": rotacionar_ccw,
+    "B": rotacionar_180,
+}
 
-    soma = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).reshape(-1)
+CUSTOM_ERRORS: Final[tuple[type[Exception], ...]] = (
+    FileAccessError,
+    CameraConnectionError,
+    ScannerCalibrationError,
+    CubeStateError,
+    SolverError,
+)
 
-    ordenados[0] = pts[np.argmin(soma)]
-    ordenados[2] = pts[np.argmax(soma)]
-    ordenados[1] = pts[np.argmin(diff)]
-    ordenados[3] = pts[np.argmax(diff)]
 
-    return ordenados
+@dataclass(frozen=True, slots=True)
+class CaptureStep:
+    """Representa uma etapa da maquina de estados de captura."""
 
-# --- 2. CONFIGURAÇÃO DA CÂMERA ---
-def encontrar_camera_c920():
-    if platform.system() == "Windows":
-        try:
-            from pygrabber.dshow_graph import FilterGraph
-            graph = FilterGraph()
-            devices = graph.get_input_devices()
-            for indice, nome in enumerate(devices):
-                if "C920" in nome.upper():
-                    return indice
-        except ImportError:
-            pass
-    for i in range(5):
-        cap_temp = cv2.VideoCapture(i)
-        if cap_temp.isOpened():
-            cap_temp.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            cap_temp.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            if cap_temp.get(cv2.CAP_PROP_FRAME_WIDTH) == 1920:
-                cap_temp.release()
-                return i
-    return 0
+    kind: StepKind
+    face: str | None = None
 
-indice_c920 = encontrar_camera_c920()
-cap = cv2.VideoCapture(indice_c920, cv2.CAP_DSHOW if platform.system() == "Windows" else 0)
 
-print("Aguardando a câmera iniciar...")
-time.sleep(1.5)
+def build_capture_steps() -> list[CaptureStep]:
+    """Monta a sequencia de leitura esperada para as seis faces do cubo."""
 
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    steps = [CaptureStep("capture", "U")]
+    for face in ("F", "R", "D", "L", "B"):
+        steps.append(CaptureStep("return_u"))
+        steps.append(CaptureStep("capture", face))
 
-cv2.namedWindow("Deteccao Automatica", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Deteccao Automatica", 1280, 720)
+    return steps
 
-# Variáveis de Memória e Otimização
-pontos_suavizados = None
-frames_perdidos = 0
-MAX_FRAMES_PERDIDOS = 10
-escala = 0.5  # Processa o contorno na metade da resolução para ser muito rápido
 
-while True:
-    success, frame = cap.read()
-    if not success:
-        break
+def run() -> int:
+    """Executa o fluxo principal da aplicacao."""
 
-    # --- 3. DETECÇÃO DA SILHUETA EXTERNA DO CUBO ---
-    frame_reduzido = cv2.resize(frame, (0, 0), fx=escala, fy=escala)
-    gray = cv2.cvtColor(frame_reduzido, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    
-    # Canny acha as bordas. Em cubos stickerless, a borda externa contra a mesa é a mais forte.
-    edges = cv2.Canny(blurred, 30, 80)
-    
-    kernel = np.ones((7, 7), np.uint8)
-    # Fechamento ajuda a ignorar as pequenas linhas de divisão entre as peças plásticas
-    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
-    
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    captured_faces: dict[str, FaceGrid] = {}
 
-    contorno_cubo = None
+    try:
+        calibrations = load_json(CALIBRATION_FILE)
+        scanner = FaceScanner(calibrations)
+        steps = build_capture_steps()
+        captured_faces = capture_faces(scanner, steps)
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > (8000 * (escala ** 2)):  # Cubo precisa ter um tamanho razoável
-            perimetro = cv2.arcLength(cnt, True)
-            # 0.06 de tolerância ajuda a pegar as quinas arredondadas dos speedcubes
-            aprox = cv2.approxPolyDP(cnt, 0.06 * perimetro, True)
-            
-            if len(aprox) == 4:
-                x, y, w, h = cv2.boundingRect(aprox)
-                aspect_ratio = float(w) / h
-                if 0.6 <= aspect_ratio <= 1.4: # Garante que não é um retângulo esticado
-                    contorno_cubo = aprox / escala # Reverte a escala para bater com o frame 1080p
-                    break
+        if len(captured_faces) != len(FACE_ORDEM):
+            print("Captura interrompida antes de ler as seis faces.")
+            return 0
 
-    # --- 4. TRAVAMENTO (LOCK-ON) ---
-    if contorno_cubo is not None:
-        pts_atuais = ordenar_pontos(contorno_cubo)
-        
-        if pontos_suavizados is None:
-            pontos_suavizados = pts_atuais
-        else:
-            pontos_suavizados = (pts_atuais * 0.7) + (pontos_suavizados * 0.3)
-            
-        frames_perdidos = 0
+        cube = Cube(captured_faces)
+        cube_state_string = cube.get_kociemba_string()
+
+        solver = Solver()
+        moves = solver.solve(cube_state_string)
+
+        print("\nEstado do Cubo (Notacao Kociemba):")
+        print(cube_state_string)
+        print("\nSolucao Bruta:")
+        print(" ".join(moves))
+        print(solver.translate_solution(moves))
+        return 0
+
+    except CUSTOM_ERRORS as exc:
+        print("\nNao foi possivel concluir a operacao.")
+        print(str(exc))
+        return 1
+    except KeyboardInterrupt:
+        print("\nOperacao interrompida pelo utilizador.")
+        return 0
+    finally:
+        cv2.destroyAllWindows()
+
+
+def capture_faces(scanner: FaceScanner, steps: list[CaptureStep]) -> dict[str, FaceGrid]:
+    """Captura as seis faces do cubo usando camera e scanner."""
+
+    captured_faces: dict[str, FaceGrid] = {}
+    step_index = 0
+    stable_count = 0
+    last_signature: tuple[tuple[str, ...], ...] | tuple[str, str] | None = None
+    top_center_color: str | None = None
+
+    cv2.namedWindow(JANELA_DETECCAO, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(JANELA_DETECCAO, WINDOW_WIDTH, WINDOW_HEIGHT)
+
+    with Camera() as cam:
+        while step_index < len(steps):
+            frame = cam.get_frame()
+            result = scanner.scan_frame(frame)
+            current_step = steps[step_index]
+
+            signature = get_stable_signature(result, current_step, top_center_color)
+            if signature is None:
+                stable_count = 0
+                last_signature = None
+            elif signature == last_signature:
+                stable_count += 1
+            else:
+                stable_count = 1
+                last_signature = signature
+
+            if (
+                stable_count >= STABLE_FRAMES_REQUIRED
+                and current_step.kind == "capture"
+                and current_step.face is not None
+                and result.grid is not None
+            ):
+                face = current_step.face
+                captured_faces[face] = apply_capture_rotation(face, result.grid)
+
+                if face == "U":
+                    top_center_color = captured_faces[face][1][1]
+
+                print(f"Face capturada: {face}")
+                step_index += 1
+                stable_count = 0
+                last_signature = None
+                scanner.reset_tracking()
+            elif stable_count >= STABLE_FRAMES_REQUIRED:
+                step_index += 1
+                stable_count = 0
+                last_signature = None
+                scanner.reset_tracking()
+
+            if step_index < len(steps):
+                current_step = steps[step_index]
+
+            frame_to_show = (
+                result.annotated_frame if result.annotated_frame is not None else frame
+            )
+            draw_hud(
+                frame_to_show,
+                current_step,
+                captured_faces,
+                stable_count,
+                STABLE_FRAMES_REQUIRED,
+            )
+            show_windows(frame_to_show, result)
+
+            if cv2.waitKey(1) & 0xFF == ESC_KEY:
+                break
+
+    return captured_faces
+
+
+def get_stable_signature(
+    result: ScanFrameResult,
+    step: CaptureStep,
+    top_center_color: str | None,
+) -> tuple[tuple[str, ...], ...] | tuple[str, str] | None:
+    """Extrai a assinatura usada para confirmar que a leitura esta estavel."""
+
+    if not result.has_valid_grid or result.grid is None:
+        return None
+
+    if step.kind == "return_u":
+        if top_center_color is None or result.center_color != top_center_color:
+            return None
+        return ("return_u", result.center_color)
+
+    if step.face == "U":
+        return grid_signature(result.grid)
+
+    if top_center_color is None or result.center_color == top_center_color:
+        return None
+
+    return grid_signature(result.grid)
+
+
+def grid_signature(grid: FaceGrid) -> tuple[tuple[str, ...], ...]:
+    """Converte uma grade mutavel numa assinatura hashable."""
+
+    return tuple(tuple(row) for row in grid)
+
+
+def apply_capture_rotation(face: str, grid: FaceGrid) -> FaceGrid:
+    """Aplica a rotacao de orientacao legada antes de guardar a face."""
+
+    rotation = FACE_ROTATIONS.get(face)
+    if rotation is None:
+        return [row.copy() for row in grid]
+
+    return rotation(grid)
+
+
+def draw_hud(
+    frame,
+    step: CaptureStep,
+    captured_faces: dict[str, FaceGrid],
+    stable_count: int,
+    stable_frames_required: int,
+) -> None:
+    """Desenha as instrucoes da etapa atual no frame anotado."""
+
+    text_color = (0, 255, 255)
+    white = (255, 255, 255)
+
+    cv2.putText(
+        frame,
+        f"Estado: {current_instruction(step)}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        text_color,
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"Capturadas: {captured_faces_text(captured_faces)}",
+        (20, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        white,
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"Estavel: {stable_count}/{stable_frames_required}",
+        (20, 100),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        white,
+        2,
+    )
+    cv2.putText(
+        frame,
+        "[ESC] Sair",
+        (20, 130),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        white,
+        2,
+    )
+
+
+def current_instruction(step: CaptureStep) -> str:
+    """Retorna a instrucao textual para a etapa atual."""
+
+    if step.kind == "return_u":
+        return "Volte a face TOPO (U) para a lente"
+
+    if step.face is None:
+        return "Prepare o cubo"
+
+    face_name = FACE_NOMES.get(step.face, step.face)
+    hint = CAPTURE_HINTS.get(step.face, "")
+    return f"Mostre {face_name} {hint}".strip()
+
+
+def captured_faces_text(captured_faces: dict[str, FaceGrid]) -> str:
+    """Formata a lista de faces ja capturadas para o HUD."""
+
+    return " ".join(face for face in FACE_ORDEM if face in captured_faces)
+
+
+def show_windows(frame, result: ScanFrameResult) -> None:
+    """Mostra as janelas de deteccao e de face recortada."""
+
+    if result.annotated_face is not None:
+        cv2.imshow(JANELA_FACE, result.annotated_face)
     else:
-        frames_perdidos += 1
-        if frames_perdidos > MAX_FRAMES_PERDIDOS:
-            pontos_suavizados = None
+        destroy_window_if_open(JANELA_FACE)
 
-    # --- 5. RECORTE PERSPECTIVO E LEITURA DA GRADE ---
-    if pontos_suavizados is not None:
-        # Desenha a borda da detecção na tela original
-        borda_int = np.int32(pontos_suavizados).reshape((-1, 1, 2))
-        cv2.polylines(frame, [borda_int], isClosed=True, color=(0, 255, 0), thickness=3)
+    cv2.imshow(JANELA_DETECCAO, frame)
 
-        # Achata a imagem do cubo para um quadrado perfeito 300x300
-        pts_destino = np.float32([[0, 0], [300, 0], [300, 300], [0, 300]])
-        matriz_perspectiva = cv2.getPerspectiveTransform(np.float32(pontos_suavizados), pts_destino)
-        face_recortada = cv2.warpPerspective(frame, matriz_perspectiva, (300, 300))
 
-        hsv_recortado = cv2.cvtColor(face_recortada, cv2.COLOR_BGR2HSV)
-        
-        mascaras = {}
-        for nome_cor, limites in calibracoes.items():
-            lower = np.array(limites['lower'])
-            upper = np.array(limites['upper'])
-            mascaras[nome_cor] = cv2.inRange(hsv_recortado, lower, upper)
+def destroy_window_if_open(window_name: str) -> None:
+    """Fecha uma janela OpenCV sem propagar erro caso ela nao exista."""
 
-        # Como a imagem tem 300x300, sabemos que cada peça tem 100x100.
-        tamanho_quadrado = 100
-       
-        # Vamos olhar APENAS para os 40x40 pixels bem no centro da peça, ignorando as sombras da divisão física!
-        margem = 30 
-        area_interna = (tamanho_quadrado - 2*margem) ** 2 
+    try:
+        cv2.destroyWindow(window_name)
+    except cv2.error:
+        pass
 
-        centro_cor = "Nenhum"
-        
-        for linha in range(3):
-            for coluna in range(3):
-                x = coluna * tamanho_quadrado
-                y = linha * tamanho_quadrado
-                
-                melhor_cor = "Nenhum"
-                max_pixels = 0
-                
-                for nome_cor, mask in mascaras.items():
-                    # Recorta apenas a área de segurança (miolinho)
-                    roi_mask = mask[y+margem:y+tamanho_quadrado-margem, x+margem:x+tamanho_quadrado-margem]
-                    pixels = cv2.countNonZero(roi_mask)
-                    
-                    if pixels > max_pixels:
-                        max_pixels = pixels
-                        melhor_cor = nome_cor
 
-                cor_borda = (255, 255, 255)
-                texto = ""
-                
-                # Diminui a exigência: se 15% do miolinho for da cor, já aceitamos
-                if max_pixels > (area_interna * 0.15) and melhor_cor != "Nenhum":
-                    cor_borda = cores_visuais.get(melhor_cor, (255, 255, 255))
-                    texto = melhor_cor[:3].upper()
-
-                if linha == 1 and coluna == 1:
-                    centro_cor = melhor_cor if texto else "Nenhum"
-
-                # Desenha o quadrado da peça toda
-                cv2.rectangle(face_recortada, (x, y), (x + tamanho_quadrado, y + tamanho_quadrado), (100, 100, 100), 1)
-                
-                # Desenha o quadradinho de leitura (miolo) com a cor detectada
-                cv2.rectangle(face_recortada, (x+margem, y+margem), (x+tamanho_quadrado-margem, y+tamanho_quadrado-margem), cor_borda, 2)
-
-                if linha == 1 and coluna == 1:
-                    # Destaca o centro da face para facilitar a leitura
-                    cv2.drawMarker(face_recortada, (x + 50, y + 50), cor_borda, markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-
-                if texto:
-                    cv2.putText(face_recortada, texto, (x + 30, y + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, cor_borda, 2)
-
-        if centro_cor != "Nenhum":
-            cor_texto_centro = cores_visuais.get(centro_cor, (255, 255, 255))
-            cv2.putText(face_recortada, f"CENTRO: {centro_cor.upper()}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor_texto_centro, 2)
-
-        cv2.imshow("Face Lida (Grade 3x3)", face_recortada)
-    else:
-        try:
-            cv2.destroyWindow("Face Lida (Grade 3x3)")
-        except:
-            pass
-
-    cv2.putText(frame, "Caca-Pecas Automatico", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
-    cv2.putText(frame, "Caca-Pecas Automatico", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-    cv2.putText(frame, "[ESC] Sair", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-    cv2.imshow("Deteccao Automatica", frame)
-
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    raise SystemExit(run())
